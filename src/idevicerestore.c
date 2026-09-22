@@ -88,7 +88,6 @@ static struct option longopts[] = {
 	{ "no-input",       no_argument,       NULL, 'y' },
 	{ "plain-progress", no_argument,       NULL, 'P' },
 	{ "restore-mode",   no_argument,       NULL, 'R' },
-	{ "ticket",         required_argument, NULL, 'T' },
 	{ "no-restore",     no_argument,       NULL, 'z' },
 	{ "version",        no_argument,       NULL, 'v' },
 	{ "ipsw-info",      no_argument,       NULL, 'I' },
@@ -166,7 +165,6 @@ static void usage(int argc, char* argv[], int err)
 	PWN_FLAG_LINE \
 	"  -P, --plain-progress  Print progress as plain step and progress\n" \
 	"  -R, --restore-mode    Allow restoring from Restore mode\n" \
-	"  -T, --ticket PATH     Use file at PATH to send as AP ticket\n" \
 	"  --variant VARIANT     Use given VARIANT to match the build identity to use,\n" \
         "                        e.g. 'Customer Erase Install (IPSW)'\n" \
 	"  --ignore-errors       Try to continue the restore process after certain\n" \
@@ -1277,46 +1275,32 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 		if (client->flags & FLAG_QUIT) {
 			return -1;
 		}
-		
-		if (client->mode == MODE_RESTORE && client->root_ticket) {
-			plist_t ap_ticket = plist_new_data((char*)client->root_ticket, client->root_ticket_len);
-			if (!ap_ticket) {
-				logger(LL_ERROR, "Failed to create ApImg4Ticket node value.\n");
+
+		if (get_tss_response(client, build_identity, &client->tss) < 0) {
+			logger(LL_ERROR, "Unable to get SHSH blobs for this device\n");
+			return -1;
+		}
+		if (client->macos_variant) {
+			if (get_local_policy_tss_response(client, build_identity, &client->tss_localpolicy) < 0) {
+				logger(LL_ERROR, "Unable to get SHSH blobs for this device (local policy)\n");
 				return -1;
 			}
-			client->tss = plist_new_dict();
-			if (!client->tss) {
-				logger(LL_ERROR, "Failed to create ApImg4Ticket node.\n");
+			if (get_recoveryos_root_ticket_tss_response(client, build_identity, &client->tss_recoveryos_root_ticket) < 0) {
+				logger(LL_ERROR, "Unable to get SHSH blobs for this device (recovery OS Root Ticket)\n");
 				return -1;
 			}
-			plist_dict_set_item(client->tss, "ApImg4Ticket", ap_ticket);
 		} else {
-			if (get_tss_response(client, build_identity, &client->tss) < 0) {
-				logger(LL_ERROR, "Unable to get SHSH blobs for this device\n");
-				return -1;
-			}
-			if (client->macos_variant) {
-				if (get_local_policy_tss_response(client, build_identity, &client->tss_localpolicy) < 0) {
-					logger(LL_ERROR, "Unable to get SHSH blobs for this device (local policy)\n");
+			plist_t recovery_variant = plist_access_path(build_identity, 2, "Info", "RecoveryVariant");
+			if (recovery_variant) {
+				const char* recovery_variant_str = plist_get_string_ptr(recovery_variant, NULL);
+				client->recovery_variant = build_manifest_get_build_identity_for_model_with_variant(client->build_manifest, client->device->hardware_model, recovery_variant_str, 1);
+				if (!client->recovery_variant) {
+					logger(LL_ERROR, "Variant '%s' not found in BuildManifest\n", recovery_variant_str);
 					return -1;
 				}
-				if (get_recoveryos_root_ticket_tss_response(client, build_identity, &client->tss_recoveryos_root_ticket) < 0) {
-					logger(LL_ERROR, "Unable to get SHSH blobs for this device (recovery OS Root Ticket)\n");
+				if (get_tss_response(client, client->recovery_variant, &client->tss_recoveryos_root_ticket) < 0) {
+					logger(LL_ERROR, "Unable to get SHSH blobs for this device (%s)\n", recovery_variant_str);
 					return -1;
-				}
-			} else {
-				plist_t recovery_variant = plist_access_path(build_identity, 2, "Info", "RecoveryVariant");
-				if (recovery_variant) {
-					const char* recovery_variant_str = plist_get_string_ptr(recovery_variant, NULL);
-					client->recovery_variant = build_manifest_get_build_identity_for_model_with_variant(client->build_manifest, client->device->hardware_model, recovery_variant_str, 1);
-					if (!client->recovery_variant) {
-						logger(LL_ERROR, "Variant '%s' not found in BuildManifest\n", recovery_variant_str);
-						return -1;
-					}
-					if (get_tss_response(client, client->recovery_variant, &client->tss_recoveryos_root_ticket) < 0) {
-						logger(LL_ERROR, "Unable to get SHSH blobs for this device (%s)\n", recovery_variant_str);
-						return -1;
-					}
 				}
 			}
 		}
@@ -1659,9 +1643,6 @@ void idevicerestore_client_free(struct idevicerestore_client_t* client)
 	if (client->cache_dir) {
 		free(client->cache_dir);
 	}
-	if (client->root_ticket) {
-		free(client->root_ticket);
-	}
 	if (client->build_manifest) {
 		plist_free(client->build_manifest);
 	}
@@ -1962,18 +1943,6 @@ int main(int argc, char* argv[])
 		case 'v':
 			printf("%s %s (libirecovery %s, libtatsu %s)\n", PACKAGE_NAME, PACKAGE_VERSION, irecv_version(), libtatsu_version());
 			return EXIT_SUCCESS;
-
-		case 'T': {
-			size_t root_ticket_len = 0;
-			unsigned char* root_ticket = NULL;
-			if (read_file(optarg, (void**)&root_ticket, &root_ticket_len) != 0) {
-				return EXIT_FAILURE;
-			}
-			client->root_ticket = root_ticket;
-			client->root_ticket_len = (int)root_ticket_len;
-			logger(LL_INFO, "Using ApTicket found at %s length %u\n", optarg, client->root_ticket_len);
-			break;
-		}
 
 		case 'I':
 			ipsw_info = 1;

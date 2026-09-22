@@ -1103,38 +1103,33 @@ int restore_send_recovery_os_root_ticket(struct idevicerestore_client_t* client,
 
 	logger(LL_INFO, "About to send RecoveryOSRootTicket...\n");
 
-	if (client->root_ticket) {
-		dict = plist_new_dict();
-		plist_dict_set_item(dict, "RecoveryOSRootTicketData", plist_new_data((char*)client->root_ticket, client->root_ticket_len));
-	} else {
-		unsigned char* data = NULL;
-		unsigned int len = 0;
+	unsigned char* data = NULL;
+	unsigned int len = 0;
 
-		if (!client->tss_recoveryos_root_ticket && !(client->flags & FLAG_CUSTOM)) {
-			logger(LL_ERROR, "Cannot send RootTicket without TSS\n");
+	if (!client->tss_recoveryos_root_ticket && !(client->flags & FLAG_CUSTOM)) {
+		logger(LL_ERROR, "Cannot send RootTicket without TSS\n");
+		return -1;
+	}
+
+	if (client->image4supported) {
+		if (tss_response_get_ap_img4_ticket(client->tss_recoveryos_root_ticket, &data, &len) < 0) {
+			logger(LL_ERROR, "Unable to get ApImg4Ticket from TSS\n");
 			return -1;
 		}
-
-		if (client->image4supported) {
-			if (tss_response_get_ap_img4_ticket(client->tss_recoveryos_root_ticket, &data, &len) < 0) {
-				logger(LL_ERROR, "Unable to get ApImg4Ticket from TSS\n");
-				return -1;
-			}
-		} else {
-			if (!(client->flags & FLAG_CUSTOM) && (tss_response_get_ap_ticket(client->tss, &data, &len) < 0)) {
-				logger(LL_ERROR, "Unable to get ticket from TSS\n");
-				return -1;
-			}
+	} else {
+		if (!(client->flags & FLAG_CUSTOM) && (tss_response_get_ap_ticket(client->tss, &data, &len) < 0)) {
+			logger(LL_ERROR, "Unable to get ticket from TSS\n");
+			return -1;
 		}
-
-		dict = plist_new_dict();
-		if (data && (len > 0)) {
-			plist_dict_set_item(dict, "RootTicketData", plist_new_data((char*)data, len));
-		} else {
-			logger(LL_NOTICE, "Not sending RootTicketData (no data present)\n");
-		}
-		free(data);
 	}
+
+	dict = plist_new_dict();
+	if (data && (len > 0)) {
+		plist_dict_set_item(dict, "RootTicketData", plist_new_data((char*)data, len));
+	} else {
+		logger(LL_NOTICE, "Not sending RootTicketData (no data present)\n");
+	}
+	free(data);
 
 	restore_service_client_t service = _restore_get_service_client_for_data_request(client, message);
 	if (!service) {
@@ -1163,38 +1158,33 @@ int restore_send_root_ticket(struct idevicerestore_client_t* client, plist_t mes
 
 	logger(LL_INFO, "About to send RootTicket...\n");
 
-	if (client->root_ticket) {
-		dict = plist_new_dict();
-		plist_dict_set_item(dict, "RootTicketData", plist_new_data((char*)client->root_ticket, client->root_ticket_len));
-	} else {
-		unsigned char* data = NULL;
-		unsigned int len = 0;
+	unsigned char* data = NULL;
+	unsigned int len = 0;
 
-		if (!client->tss && !(client->flags & FLAG_CUSTOM)) {
-			logger(LL_ERROR, "Cannot send RootTicket without TSS\n");
+	if (!client->tss && !(client->flags & FLAG_CUSTOM)) {
+		logger(LL_ERROR, "Cannot send RootTicket without TSS\n");
+		return -1;
+	}
+
+	if (client->image4supported) {
+		if (tss_response_get_ap_img4_ticket(client->tss, &data, &len) < 0) {
+			logger(LL_ERROR, "Unable to get ApImg4Ticket from TSS\n");
 			return -1;
 		}
-
-		if (client->image4supported) {
-			if (tss_response_get_ap_img4_ticket(client->tss, &data, &len) < 0) {
-				logger(LL_ERROR, "Unable to get ApImg4Ticket from TSS\n");
-				return -1;
-			}
-		} else {
-			if (!(client->flags & FLAG_CUSTOM) && (tss_response_get_ap_ticket(client->tss, &data, &len) < 0)) {
-				logger(LL_ERROR, "Unable to get ticket from TSS\n");
-				return -1;
-			}
+	} else {
+		if (!(client->flags & FLAG_CUSTOM) && (tss_response_get_ap_ticket(client->tss, &data, &len) < 0)) {
+			logger(LL_ERROR, "Unable to get ticket from TSS\n");
+			return -1;
 		}
-
-		dict = plist_new_dict();
-		if (data && (len > 0)) {
-			plist_dict_set_item(dict, "RootTicketData", plist_new_data((char*)data, len));
-		} else {
-			logger(LL_INFO, "Not sending RootTicketData (no data present)\n");
-		}
-		free(data);
 	}
+
+	dict = plist_new_dict();
+	if (data && (len > 0)) {
+		plist_dict_set_item(dict, "RootTicketData", plist_new_data((char*)data, len));
+	} else {
+		logger(LL_INFO, "Not sending RootTicketData (no data present)\n");
+	}
+	free(data);
 
 	restore_service_client_t service = _restore_get_service_client_for_data_request(client, message);
 	if (!service) {
@@ -5165,7 +5155,7 @@ static int restore_handle_restore_attestation(struct idevicerestore_client_t* cl
 	plist_t dict = plist_new_dict();
 	plist_dict_set_item(dict, "RestoreShouldAttest", plist_new_bool(0));
 	restored_error_t restore_error = restored_send(client->restore->client, dict);
-	plist_free(dict);	
+	plist_free(dict);
 	if (restore_error != RESTORE_E_SUCCESS) {
 		logger(LL_ERROR, "Unable to send RestoreShouldAttest (%d)\n", restore_error);
 		return -1;
