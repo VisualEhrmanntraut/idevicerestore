@@ -27,6 +27,8 @@ extern "C" {
 #endif
 
 int img4_stitch_component(const char* component_name, const void* component_data, size_t component_size, plist_t parameters, plist_t tss_response, void** img4_data, size_t *img4_size);
+int img4_decrypt_im4p(const void* im4p_data, size_t im4p_size, const unsigned char iv[16], const unsigned char key[32], void** out_data, size_t* out_size);
+int img4_get_im4p_digest(const char* component_name, const void* im4p_data, size_t im4p_size, unsigned char* digest, size_t digest_size);
 int img4_create_local_manifest(plist_t request, plist_t build_identity, plist_t* manifest);
 
 #ifdef __cplusplus

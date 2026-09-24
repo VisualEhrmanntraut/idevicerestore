@@ -98,6 +98,13 @@ esac
 AM_CONDITIONAL(WIN32, test x$win32 = xtrue)
 AM_CONDITIONAL(DARWIN, test x$darwin = xtrue)
 
+if test x$darwin != xtrue; then
+  PKG_CHECK_MODULES(openssl, libcrypto >= 1.1.0, have_openssl=yes, have_openssl=no)
+  if test "x$have_openssl" = "xyes"; then
+    AC_DEFINE(HAVE_OPENSSL, 1, [Define if OpenSSL libcrypto is available])
+  fi
+fi
+
 if test x$win32 != xtrue; then
   if test "x$ac_cv_func_mkstemp" != xyes; then
     AC_CHECK_LIB(pthread, [pthread_self], [], [AC_MSG_ERROR([pthread is required to build $PACKAGE])])

@@ -19,10 +19,22 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
+
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <libtatsu/tss.h>
+#include <libimobiledevice-glue/sha.h>
+
+#ifdef __APPLE__
+#include <CommonCrypto/CommonCryptor.h>
+#elif defined(HAVE_OPENSSL)
+#include <openssl/evp.h>
+#endif
 
 #include "common.h"
 #include "img4.h"
@@ -402,6 +414,217 @@ static const char *_img4_get_component_tag(const char *compname)
 	return NULL;
 }
 
+/* components whose IM4P tag img4_stitch_component() replaces with the component tag */
+static int _img4_component_is_retagged(const char *compname)
+{
+	const char* matches[] = {
+		"RestoreKernelCache",
+		"RestoreDeviceTree",
+		"RestoreSEP",
+		"RestoreLogo",
+		"RestoreTrustCache",
+		"RestoreDCP",
+		"Ap,RestoreDCP2",
+		"Ap,RestoreTMU",
+		"Ap,RestoreCIO",
+		"Ap,DCP2",
+		"Ap,RestoreSecureM3Firmware",
+		"Ap,RestoreSecurePageTableMonitor",
+		"Ap,RestoreTrustedExecutionMonitor",
+		"Ap,RestorecL4",
+		NULL
+	};
+	int i = 0;
+
+	while (matches[i]) {
+		if (!strcmp(matches[i], compname)) {
+			return 1;
+		}
+		i++;
+	}
+
+	return 0;
+}
+
+static int asn1_read_header(const unsigned char* data, size_t avail, unsigned char* type, size_t* hdr_size, size_t* size)
+{
+	size_t off = 0;
+	unsigned int n;
+
+	if (avail < 2)
+		return -1;
+
+	*type = data[off++];
+	if (data[off] & 0x80) {
+		n = data[off++] & 0x7F;
+		if (n == 0 || n > 4 || avail - off < n)
+			return -1;
+		*size = 0;
+		while (n--)
+			*size = (*size << 8) | data[off++];
+	} else {
+		*size = data[off++];
+	}
+	if (*size > avail - off)
+		return -1;
+
+	*hdr_size = off;
+	return 0;
+}
+
+static int aes256_cbc_decrypt(const unsigned char* iv, const unsigned char* key, unsigned char* buf, size_t size)
+{
+#ifdef __APPLE__
+	size_t moved = 0;
+	return (CCCrypt(kCCDecrypt, kCCAlgorithmAES, 0, key, kCCKeySizeAES256, iv, buf, size, buf, size, &moved) == kCCSuccess && moved == size) ? 0 : -1;
+#elif defined(HAVE_OPENSSL)
+	int outl = 0;
+	int ok;
+	EVP_CIPHER_CTX* ctx;
+
+	if (size > INT_MAX)
+		return -1;
+	ctx = EVP_CIPHER_CTX_new();
+	if (!ctx)
+		return -1;
+	ok = EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) == 1
+	    && EVP_CIPHER_CTX_set_padding(ctx, 0) == 1
+	    && EVP_DecryptUpdate(ctx, buf, &outl, buf, (int)size) == 1
+	    && (size_t)outl == size;
+	EVP_CIPHER_CTX_free(ctx);
+	return ok ? 0 : -1;
+#else
+	logger(LL_ERROR, "%s: built without AES support\n", __func__);
+	return -1;
+#endif
+}
+
+int img4_decrypt_im4p(const void* im4p_data, size_t im4p_size, const unsigned char iv[16], const unsigned char key[32], void** out_data, size_t* out_size)
+{
+	const unsigned char* data = (const unsigned char*)im4p_data;
+	size_t hdr_size, size, off, end;
+	size_t payload_off = 0, payload_size = 0;
+	size_t kbag_off = 0, kbag_end = 0;
+	unsigned char type;
+	unsigned char* out;
+	unsigned char* p;
+	unsigned int out_hdr_size = 0;
+	int i;
+
+	*out_data = NULL;
+	*out_size = 0;
+
+	if (asn1_read_header(data, im4p_size, &type, &hdr_size, &size) < 0 || type != (ASN1_CONSTRUCTED | ASN1_SEQUENCE)) {
+		logger(LL_ERROR, "%s: not a DER sequence\n", __func__);
+		return -1;
+	}
+	off = hdr_size;
+	end = hdr_size + size;
+
+	for (i = 0; off < end; i++) {
+		size_t el_hdr_size, el_size;
+		if (asn1_read_header(data + off, end - off, &type, &el_hdr_size, &el_size) < 0) {
+			logger(LL_ERROR, "%s: malformed element %d\n", __func__, i);
+			return -1;
+		}
+		if (i == 0 && (type != ASN1_IA5_STRING || el_size != 4 || memcmp(data + off + el_hdr_size, "IM4P", 4) != 0)) {
+			logger(LL_ERROR, "%s: not an IM4P\n", __func__);
+			return -1;
+		}
+		if (i == 3) {
+			if (type != ASN1_OCTET_STRING) {
+				logger(LL_ERROR, "%s: IM4P payload is not an octet string\n", __func__);
+				return -1;
+			}
+			payload_off = off + el_hdr_size;
+			payload_size = el_size;
+		}
+		if (i == 4 && type == ASN1_OCTET_STRING) {
+			kbag_off = off;
+			kbag_end = off + el_hdr_size + el_size;
+		}
+		off += el_hdr_size + el_size;
+	}
+
+	if (payload_size == 0) {
+		logger(LL_ERROR, "%s: IM4P has no payload\n", __func__);
+		return -1;
+	}
+	if (kbag_end == 0) {
+		return 1;
+	}
+
+	size = end - hdr_size - (kbag_end - kbag_off);
+	out = (unsigned char*)malloc(1 + 5 + size);
+	if (!out) {
+		return -1;
+	}
+	out[0] = ASN1_CONSTRUCTED | ASN1_SEQUENCE;
+	p = out + 1;
+	asn1_write_size(size, &p, &out_hdr_size);
+	out_hdr_size++;
+	memcpy(p, data + hdr_size, kbag_off - hdr_size);
+	p += kbag_off - hdr_size;
+	memcpy(p, data + kbag_end, end - kbag_end);
+
+	if (aes256_cbc_decrypt(iv, key, out + out_hdr_size + (payload_off - hdr_size), payload_size & ~(size_t)15) < 0) {
+		logger(LL_ERROR, "%s: decryption failed\n", __func__);
+		free(out);
+		return -1;
+	}
+
+	*out_data = out;
+	*out_size = out_hdr_size + size;
+	return 0;
+}
+
+int img4_get_im4p_digest(const char* component_name, const void* im4p_data, size_t im4p_size, unsigned char* digest, size_t digest_size)
+{
+	const unsigned char* data = (const unsigned char*)im4p_data;
+	const unsigned char* tag;
+	const char* comptag = NULL;
+	size_t tag_off;
+
+	tag = asn1_find_element(1, ASN1_IA5_STRING, data);
+	if (!tag || tag[-1] != 4) {
+		logger(LL_ERROR, "%s: IM4P type tag not found\n", __func__);
+		return -1;
+	}
+	tag_off = tag - data;
+
+	/* hash the tag the stitched image will carry */
+	if (_img4_component_is_retagged(component_name)) {
+		comptag = _img4_get_component_tag(component_name);
+	}
+	if (!comptag) {
+		comptag = (const char*)tag;
+	}
+
+	switch (digest_size) {
+	case 20: {
+		sha1_context ctx;
+		sha1_init(&ctx);
+		sha1_update(&ctx, data, tag_off);
+		sha1_update(&ctx, comptag, 4);
+		sha1_update(&ctx, data + tag_off + 4, im4p_size - tag_off - 4);
+		sha1_final(&ctx, digest);
+	}	break;
+	case 48: {
+		sha384_context ctx;
+		sha384_init(&ctx);
+		sha384_update(&ctx, data, tag_off);
+		sha384_update(&ctx, comptag, 4);
+		sha384_update(&ctx, data + tag_off + 4, im4p_size - tag_off - 4);
+		sha384_final(&ctx, digest);
+	}	break;
+	default:
+		logger(LL_ERROR, "%s: unsupported digest size %zu\n", __func__, digest_size);
+		return -1;
+	}
+
+	return 0;
+}
+
 int img4_stitch_component(const char* component_name, const void* component_data, size_t component_size, plist_t parameters, plist_t tss_response, void** img4_data, size_t *img4_size)
 {
 	unsigned char* magic_header = NULL;
@@ -430,35 +653,13 @@ int img4_stitch_component(const char* component_name, const void* component_data
 	const void *tag = asn1_find_element(1, ASN1_IA5_STRING, component_data);
 	if (tag) {
 		logger(LL_DEBUG, "Tag found\n");
-		const char* matches[] = {
-			"RestoreKernelCache",
-			"RestoreDeviceTree",
-			"RestoreSEP",
-			"RestoreLogo",
-			"RestoreTrustCache",
-			"RestoreDCP",
-			"Ap,RestoreDCP2",
-			"Ap,RestoreTMU",
-			"Ap,RestoreCIO",
-			"Ap,DCP2",
-			"Ap,RestoreSecureM3Firmware",
-			"Ap,RestoreSecurePageTableMonitor",
-			"Ap,RestoreTrustedExecutionMonitor",
-			"Ap,RestorecL4",
-			NULL
-		};
-		int i = 0;
-		while (matches[i]) {
-			if (!strcmp(matches[i], component_name)) {
-				const char* comptag = _img4_get_component_tag(component_name);
-				if (comptag) {
-					memcpy((void*)tag, comptag, 4);
-				} else {
-					logger(LL_WARNING, "Cannot find tag for component '%s'\n", component_name);
-				}
-				break;
+		if (_img4_component_is_retagged(component_name)) {
+			const char* comptag = _img4_get_component_tag(component_name);
+			if (comptag) {
+				memcpy((void*)tag, comptag, 4);
+			} else {
+				logger(LL_WARNING, "Cannot find tag for component '%s'\n", component_name);
 			}
-			i++;
 		}
 	} else {
 		logger(LL_ERROR, "Personalization failed for component '%s': Tag not found\n", component_name);

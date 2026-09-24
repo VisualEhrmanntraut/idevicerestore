@@ -9,6 +9,7 @@ AM_CFLAGS = \
 	$(libtatsu_CFLAGS) \
 	$(libzip_CFLAGS) \
 	$(zlib_CFLAGS) \
+	$(openssl_CFLAGS) \
 	$(libcurl_CFLAGS)
 
 AM_LDFLAGS = \
@@ -21,6 +22,7 @@ AM_LDFLAGS = \
 	$(libtatsu_LIBS) \
 	$(libzip_LIBS) \
 	$(zlib_LIBS) \
+	$(openssl_LIBS) \
 	$(libcurl_LIBS)
 
 AM_LDADD = $(AC_LDADD)
