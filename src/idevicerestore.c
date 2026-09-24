@@ -97,6 +97,7 @@ static struct option longopts[] = {
 #ifdef __APPLE__
 	{ "exclusive-usb",  no_argument,       NULL,  4  },
 #endif
+	{ "sep-key",        required_argument, NULL,  5  },
 	{ NULL, 0, NULL, 0 }
 };
 
@@ -167,6 +168,9 @@ static void usage(int argc, char* argv[], int err)
 	"  -R, --restore-mode    Allow restoring from Restore mode\n" \
 	"  --variant VARIANT     Use given VARIANT to match the build identity to use,\n" \
         "                        e.g. 'Customer Erase Install (IPSW)'\n" \
+	"  --sep-key IVKEY       Decrypt SEP firmware with IVKEY (hex IV followed by\n" \
+	"                        AES-256 key) and install it unencrypted; requires a\n" \
+	"                        signing server that signs arbitrary digests (-s)\n" \
 	"  --ignore-errors       Try to continue the restore process after certain\n" \
 	"                        errors (like a failed baseband update)\n" \
 	"                        WARNING: This might render the device unable to boot\n" \
@@ -358,6 +362,7 @@ static void irecv_event_cb(const irecv_device_event_t* event, void *userdata)
 }
 
 int build_identity_check_components_in_ipsw(plist_t build_identity, ipsw_archive_t ipsw);
+static int build_identity_update_decrypted_sep_digests(struct idevicerestore_client_t* client, plist_t build_identity);
 
 int idevicerestore_start(struct idevicerestore_client_t* client)
 {
@@ -1131,6 +1136,10 @@ int idevicerestore_start(struct idevicerestore_client_t* client)
 	}
 	logger(LL_INFO, "All required components found in IPSW\n");
 
+	if (client->sep_key && build_identity_update_decrypted_sep_digests(client, build_identity) < 0) {
+		return -1;
+	}
+
 	/* Get OS (filesystem) name from build identity */
 	char* os_path = NULL;
 	if (build_identity_get_component_path(build_identity, "OS", &os_path) < 0) {
@@ -1643,6 +1652,7 @@ void idevicerestore_client_free(struct idevicerestore_client_t* client)
 	if (client->cache_dir) {
 		free(client->cache_dir);
 	}
+	free(client->sep_key);
 	if (client->build_manifest) {
 		plist_free(client->build_manifest);
 	}
@@ -1971,6 +1981,24 @@ int main(int argc, char* argv[])
 			exclusive_usb_access = 1;
 			break;
 #endif
+
+		case 5: {
+			size_t i;
+			free(client->sep_key);
+			client->sep_key = malloc(48);
+			if (!client->sep_key) {
+				return EXIT_FAILURE;
+			}
+			for (i = 0; i < 96 && isxdigit((unsigned char)optarg[i]); i++) {
+				unsigned char c = tolower((unsigned char)optarg[i]);
+				unsigned char nibble = (c <= '9') ? c - '0' : c - 'a' + 10;
+				client->sep_key[i / 2] = (i & 1) ? (client->sep_key[i / 2] | nibble) : (nibble << 4);
+			}
+			if (i != 96 || optarg[i] != '\0') {
+				logger(LL_ERROR, "sep-key must be 96 hex digits (IV + AES-256 key)\n");
+				return EXIT_FAILURE;
+			}
+		}	break;
 
 		default:
 			usage(argc, argv, 1);
@@ -2837,11 +2865,110 @@ int extract_component(ipsw_archive_t ipsw, const char* path, void** component_da
 	return 0;
 }
 
+static const char* sep_components[] = { "SEP", "RestoreSEP", NULL };
+
+static int is_sep_component(const char* component_name)
+{
+	int i;
+	for (i = 0; sep_components[i]; i++) {
+		if (!strcmp(component_name, sep_components[i])) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void build_manifest_replace_component_digest(plist_t build_manifest, const char* component, const unsigned char* old_digest, const unsigned char* new_digest, uint64_t digest_size)
+{
+	plist_t identities = plist_dict_get_item(build_manifest, "BuildIdentities");
+	uint32_t i;
+
+	for (i = 0; i < plist_array_get_size(identities); i++) {
+		plist_t node = plist_access_path(plist_array_get_item(identities, i), 3, "Manifest", component, "Digest");
+		uint64_t size = 0;
+		const char* digest = plist_get_data_ptr(node, &size);
+		if (digest && size == digest_size && !memcmp(digest, old_digest, digest_size)) {
+			plist_set_data_val(node, (const char*)new_digest, digest_size);
+		}
+	}
+}
+
+static int build_identity_update_decrypted_sep_digests(struct idevicerestore_client_t* client, plist_t build_identity)
+{
+	int i;
+
+	for (i = 0; sep_components[i]; i++) {
+		const char* component = sep_components[i];
+		char* path = NULL;
+		void* data = NULL;
+		size_t size = 0;
+		void* decrypted = NULL;
+		size_t decrypted_size = 0;
+		unsigned char old_digest[48];
+		unsigned char digest[48];
+		uint64_t digest_size = 0;
+		const char* digest_ptr;
+		int ret;
+
+		plist_t digest_node = plist_access_path(build_identity, 3, "Manifest", component, "Digest");
+		digest_ptr = plist_get_data_ptr(digest_node, &digest_size);
+		if (!digest_ptr || digest_size > sizeof(old_digest)) {
+			continue;
+		}
+		memcpy(old_digest, digest_ptr, digest_size);
+		if (build_identity_get_component_path(build_identity, component, &path) < 0) {
+			continue;
+		}
+		ret = extract_component(client->ipsw, path, &data, &size);
+		free(path);
+		if (ret < 0) {
+			return -1;
+		}
+		ret = img4_decrypt_im4p(data, size, client->sep_key, client->sep_key + 16, &decrypted, &decrypted_size);
+		if (ret < 0) {
+			logger(LL_ERROR, "Unable to decrypt %s\n", component);
+			free(data);
+			return -1;
+		}
+		if (ret > 0) {
+			logger(LL_INFO, "%s is not encrypted, keeping its digest\n", component);
+			free(data);
+			continue;
+		}
+		ret = img4_get_im4p_digest(component, decrypted, decrypted_size, digest, digest_size);
+		free(decrypted);
+		free(data);
+		if (ret < 0) {
+			return -1;
+		}
+		plist_set_data_val(digest_node, (const char*)digest, digest_size);
+		build_manifest_replace_component_digest(client->build_manifest, component, old_digest, digest, digest_size);
+		logger(LL_INFO, "Updated %s digest for decrypted firmware\n", component);
+	}
+
+	return 0;
+}
+
 int personalize_component(struct idevicerestore_client_t* client, const char *component_name, const void* component_data, size_t component_size, plist_t tss_response, void** personalized_component, size_t* personalized_component_size)
 {
 	void* component_blob = NULL;
 	void* stitched_component = NULL;
 	size_t stitched_component_size = 0;
+	void* decrypted = NULL;
+	size_t decrypted_size = 0;
+
+	if (client->sep_key && is_sep_component(component_name)) {
+		int ret = img4_decrypt_im4p(component_data, component_size, client->sep_key, client->sep_key + 16, &decrypted, &decrypted_size);
+		if (ret < 0) {
+			logger(LL_ERROR, "Unable to decrypt %s\n", component_name);
+			return -1;
+		}
+		if (ret == 0) {
+			logger(LL_INFO, "Decrypted %s\n", component_name);
+			component_data = decrypted;
+			component_size = decrypted_size;
+		}
+	}
 
 	if (tss_response && plist_dict_get_item(tss_response, "ApImg4Ticket")) {
 		/* stitch ApImg4Ticket into IMG4 file */
@@ -2856,6 +2983,7 @@ int personalize_component(struct idevicerestore_client_t* client, const char *co
 			if (img3_stitch_component(component_name, component_data, component_size, component_blob, 64, &stitched_component, &stitched_component_size) < 0) {
 				logger(LL_ERROR, "Unable to replace %s IMG3 signature\n", component_name);
 				free(component_blob);
+				free(decrypted);
 				return -1;
 			}
 		} else {
@@ -2868,6 +2996,7 @@ int personalize_component(struct idevicerestore_client_t* client, const char *co
 		}
 	}
 	free(component_blob);
+	free(decrypted);
 
 	if (client->flags & FLAG_KEEP_PERS) {
 		write_file(component_name, stitched_component, stitched_component_size);

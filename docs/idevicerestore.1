@@ -103,6 +103,11 @@ Allow restoring from Restore mode
 .B \-\-variant VARIANT
 Use given VARIANT to match the build identity to use, e.g. 'Customer Erase Install (IPSW)'
 .TP
+.B \-\-sep\-key IVKEY
+Decrypt the SEP firmware with IVKEY (96 hex digits: the IV followed by the
+AES-256 key) and install it unencrypted. The manifest digests are updated to
+match, so this requires a signing server that signs arbitrary digests (see \-s).
+.TP
 .B \-\-ignore\-errors
 Try to continue the restore process after certain errors (like a failed baseband update).
 

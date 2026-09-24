@@ -126,6 +126,7 @@ struct idevicerestore_client_t {
 	char* filesystem;
 	int delete_fs;
 	int async_err;
+	unsigned char* sep_key;
 };
 
 extern int global_quit_flag;
