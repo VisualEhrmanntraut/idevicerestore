@@ -301,6 +301,7 @@ irecv_device_t restore_get_irecv_device(struct idevicerestore_client_t* client)
 	}
 
 	plist_get_string_val(node, &model);
+	plist_free(node);
 	irecv_devices_get_device_by_hardware_model(model, &irecv_device);
 	free(model);
 
@@ -1039,7 +1040,9 @@ int restore_send_filesystem(struct idevicerestore_client_t* client, plist_t mess
 		const char* fsname_base = path_get_basename(path);
 		char* parent_dir = dirname(path);
 		ipsw_dummy = ipsw_open(parent_dir);
-		file = ipsw_file_open(ipsw_dummy, fsname_base);
+		if (ipsw_dummy) {
+			file = ipsw_file_open(ipsw_dummy, fsname_base);
+		}
 		free(path);
 	} else {
 		file = ipsw_file_open(client->ipsw, fsname);
@@ -1047,7 +1050,10 @@ int restore_send_filesystem(struct idevicerestore_client_t* client, plist_t mess
 	if (!file) {
 		logger(LL_ERROR, "Unable to open '%s' in ipsw\n", fsname);
 		free(fsname);
+		ipsw_close(ipsw_dummy);
+		return -1;
 	}
+	free(fsname);
 
 	uint16_t asr_port = (uint16_t)plist_dict_get_uint(message, "DataPort");
 	if (asr_port == 0) {

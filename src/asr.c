@@ -29,6 +29,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #include <libimobiledevice/libimobiledevice.h>
 
 #include <libimobiledevice-glue/sha.h>
@@ -46,6 +47,8 @@
 #define ASR_PAYLOAD_PACKET_SIZE 1450
 #define ASR_PAYLOAD_CHUNK_SIZE 131072
 #define ASR_CHECKSUM_CHUNK_SIZE 131072
+#define ASR_SEND_MAX_STALLS 10
+#define ASR_PAYLOAD_MAX_READ_RETRIES 10
 
 int asr_open_with_timeout(idevice_t device, asr_client_t* asr, uint16_t port)
 {
@@ -80,8 +83,12 @@ int asr_open_with_timeout(idevice_t device, asr_client_t* asr, uint16_t port)
 		logger(LL_VERBOSE, "Retrying connection...\n");
 	}
 
-	asr_client_t asr_loc = (asr_client_t)malloc(sizeof(struct asr_client));
-	memset(asr_loc, '\0', sizeof(struct asr_client));
+	asr_client_t asr_loc = (asr_client_t)calloc(1, sizeof(struct asr_client));
+	if (asr_loc == NULL) {
+		logger(LL_ERROR, "Out of memory\n");
+		idevice_disconnect(connection);
+		return -1;
+	}
 	asr_loc->connection = connection;
 
 	/* receive Initiate command message */
@@ -90,21 +97,17 @@ int asr_open_with_timeout(idevice_t device, asr_client_t* asr, uint16_t port)
 	if (asr_receive(asr_loc, &data) < 0) {
 		logger(LL_ERROR, "Unable to receive data from ASR\n");
 		asr_free(asr_loc);
-		plist_free(data);
 		return -1;
 	}
 	plist_t node;
 	node = plist_dict_get_item(data, "Command");
-	if (node && (plist_get_node_type(node) == PLIST_STRING)) {
-		char* strval = NULL;
-		plist_get_string_val(node, &strval);
-		if (strval && (strcmp(strval, "Initiate") != 0)) {
-			logger(LL_ERROR, "Unexpected ASR plist received\n");
-			logger_dump_plist(LL_VERBOSE, data, 1);
-			plist_free(data);
-			asr_free(asr_loc);
-			return -1;
-		}
+	const char* command = plist_get_string_ptr(node, NULL);
+	if (!command || strcmp(command, "Initiate") != 0) {
+		logger(LL_ERROR, "Unexpected ASR plist received\n");
+		logger_dump_plist(LL_VERBOSE, data, 1);
+		plist_free(data);
+		asr_free(asr_loc);
+		return -1;
 	}
 
 	node = plist_dict_get_item(data, "Checksum Chunks");
@@ -129,7 +132,10 @@ void asr_set_progress_callback(asr_client_t asr, asr_progress_cb_t cbfunc, void*
 
 int asr_receive(asr_client_t asr, plist_t* data)
 {
+	static const char plist_end[] = "</plist>";
+	const uint32_t plist_end_len = sizeof(plist_end) - 1;
 	uint32_t size = 0;
+	uint32_t msg_size = 0;
 	char* buffer = NULL;
 	plist_t request = NULL;
 	idevice_error_t device_error = IDEVICE_E_SUCCESS;
@@ -142,19 +148,48 @@ int asr_receive(asr_client_t asr, plist_t* data)
 		return -1;
 	}
 
-	device_error = idevice_connection_receive(asr->connection, buffer, ASR_BUFFER_SIZE, &size);
-	if (device_error != IDEVICE_E_SUCCESS) {
-		logger(LL_ERROR, "Unable to receive data from ASR\n");
-		free(buffer);
+	while (msg_size == 0) {
+		uint32_t bytes = 0;
+		uint32_t i = 0;
+
+		if (size >= ASR_BUFFER_SIZE) {
+			logger(LL_ERROR, "ASR message exceeds %d bytes\n", ASR_BUFFER_SIZE);
+			free(buffer);
+			return -1;
+		}
+
+		device_error = idevice_connection_receive(asr->connection, buffer + size, ASR_BUFFER_SIZE - size, &bytes);
+		if (device_error != IDEVICE_E_SUCCESS || bytes == 0) {
+			logger(LL_ERROR, "Unable to receive data from ASR\n");
+			free(buffer);
+			return -1;
+		}
+
+		/* the end tag might have been split across two receive calls */
+		if (size >= plist_end_len) {
+			i = size - plist_end_len + 1;
+		}
+		size += bytes;
+		for (; i + plist_end_len <= size; i++) {
+			if (memcmp(buffer + i, plist_end, plist_end_len) == 0) {
+				msg_size = i + plist_end_len;
+				break;
+			}
+		}
+	}
+
+	logger(LL_DEBUG, "Received %u bytes:\n", msg_size);
+
+	plist_from_xml(buffer, msg_size, &request);
+	free(buffer);
+	if (request == NULL) {
+		logger(LL_ERROR, "Unable to parse data received from ASR\n");
 		return -1;
 	}
-	plist_from_xml(buffer, size, &request);
 
+	logger_dump_plist(LL_DEBUG, request, 1);
 	*data = request;
 
-	logger(LL_DEBUG, "Received %d bytes:\n", size);
-	logger_dump_plist(LL_DEBUG, request, 1);
-	free(buffer);
 	return 0;
 }
 
@@ -164,26 +199,47 @@ int asr_send(asr_client_t asr, plist_t data)
 	char* buffer = NULL;
 
 	plist_to_xml(data, &buffer, &size);
+	if (buffer == NULL) {
+		logger(LL_ERROR, "Unable to convert plist to XML\n");
+		return -1;
+	}
 	if (asr_send_buffer(asr, buffer, size) < 0) {
 		logger(LL_ERROR, "Unable to send plist to ASR\n");
 		free(buffer);
 		return -1;
 	}
 
-	if (buffer)
-		free(buffer);
+	free(buffer);
 	return 0;
 }
 
 int asr_send_buffer(asr_client_t asr, const void* data, size_t size)
 {
-	uint32_t bytes = 0;
-	idevice_error_t device_error = IDEVICE_E_SUCCESS;
+	const char* buf = (const char*)data;
+	size_t done = 0;
+	int stalls = 0;
 
-	device_error = idevice_connection_send(asr->connection, data, size, &bytes);
-	if (device_error != IDEVICE_E_SUCCESS || bytes != size) {
-		logger(LL_ERROR, "Unable to send data to ASR. Sent %u of %zu bytes.\n", bytes, size);
-		return -1;
+	while (done < size) {
+		uint32_t len = (size - done > INT_MAX) ? INT_MAX : (uint32_t)(size - done);
+		uint32_t bytes = 0;
+		idevice_error_t device_error = idevice_connection_send(asr->connection, buf + done, len, &bytes);
+		/* A failed or timed out send might still have transmitted a part of the data. */
+		done += bytes;
+		if (device_error == IDEVICE_E_SUCCESS && bytes == len) {
+			stalls = 0;
+			continue;
+		}
+		if (bytes > 0) {
+			logger(LL_DEBUG, "Partial send to ASR (%zu of %zu bytes), continuing\n", done, size);
+			stalls = 0;
+			continue;
+		}
+		if (++stalls > ASR_SEND_MAX_STALLS) {
+			logger(LL_ERROR, "Unable to send data to ASR. Sent %zu of %zu bytes.\n", done, size);
+			return -1;
+		}
+		logger(LL_VERBOSE, "Sending data to ASR stalled at %zu of %zu bytes (error %d), retrying (%d/%d)...\n", done, size, device_error, stalls, ASR_SEND_MAX_STALLS);
+		sleep(1);
 	}
 
 	return 0;
@@ -230,10 +286,9 @@ int asr_send_validation_packet_info(asr_client_t asr, uint64_t ipsw_size)
 int asr_perform_validation(asr_client_t asr, ipsw_file_handle_t file)
 {
 	uint64_t length = 0;
-	char* command = NULL;
+	const char* command = NULL;
 	plist_t node = NULL;
 	plist_t packet = NULL;
-	int attempts = 0;
 
 	length = ipsw_file_size(file);
 
@@ -249,23 +304,13 @@ int asr_perform_validation(asr_client_t asr, ipsw_file_handle_t file)
 			return -1;
 		}
 
-		if (packet == NULL) {
-			if (attempts < 10) {
-				logger(LL_INFO, "Retrying to receive validation packet... %d\n", attempts);
-				attempts++;
-				sleep(1);
-				continue;
-			}
-		}
-
-		attempts = 0;
-
-		node = plist_dict_get_item(packet, "Command");
-		if (!node || plist_get_node_type(node) != PLIST_STRING) {
+		command = plist_get_string_ptr(plist_dict_get_item(packet, "Command"), NULL);
+		if (!command) {
 			logger(LL_ERROR, "Unable to find command node in validation request\n");
+			logger_dump_plist(LL_VERBOSE, packet, 1);
+			plist_free(packet);
 			return -1;
 		}
-		plist_get_string_val(node, &command);
 
 		// Added for iBridgeOS 9.0 - second initiate request to change to checksum chunks
 		if (!strcmp(command, "Initiate")) {
@@ -327,6 +372,12 @@ int asr_handle_oob_data_request(asr_client_t asr, plist_t packet, ipsw_file_hand
 	}
 	plist_get_uint_val(oob_offset_node, &oob_offset);
 
+	uint64_t file_size = ipsw_file_size(file);
+	if (oob_offset > file_size || oob_length > file_size - oob_offset) {
+		logger(LL_ERROR, "Invalid OOB data request: offset 0x%" PRIx64 ", length %" PRIu64 " exceeds filesystem size %" PRIu64 "\n", oob_offset, oob_length, file_size);
+		return -1;
+	}
+
 	oob_data = (char*) malloc(oob_length);
 	if (oob_data == NULL) {
 		logger(LL_ERROR, "Out of memory\n");
@@ -339,7 +390,7 @@ int asr_handle_oob_data_request(asr_client_t asr, plist_t packet, ipsw_file_hand
 		return -1;
 	}
 	int64_t ir = ipsw_file_read(file, oob_data, oob_length);
-	if (ir != oob_length) {
+	if (ir < 0 || (uint64_t)ir != oob_length) {
 		logger(LL_ERROR, "Unable to read OOB data from filesystem offset 0x%" PRIx64 ", oob_length %" PRIu64 ", read returned %" PRIi64"\n", oob_offset, oob_length, ir);
 		free(oob_data);
 		return -1;
@@ -357,51 +408,64 @@ int asr_handle_oob_data_request(asr_client_t asr, plist_t packet, ipsw_file_hand
 int asr_send_payload(asr_client_t asr, ipsw_file_handle_t file)
 {
 	char *data = NULL;
-	uint64_t i, length, bytes = 0;
+	uint64_t length, offset = 0;
 	double progress = 0;
+	int read_retries = 0;
 
 	length = ipsw_file_size(file);
-	ipsw_file_seek(file, 0, SEEK_SET);
+	if (ipsw_file_seek(file, 0, SEEK_SET) < 0) {
+		logger(LL_ERROR, "Unable to seek to beginning of filesystem\n");
+		return -1;
+	}
 
 	data = (char*)malloc(ASR_PAYLOAD_CHUNK_SIZE + 20);
+	if (data == NULL) {
+		logger(LL_ERROR, "Out of memory\n");
+		return -1;
+	}
 
-	i = length;
-	int retry = 10;
-	while(i > 0 && retry >= 0) {
+	while (offset < length) {
 		uint32_t size = ASR_PAYLOAD_CHUNK_SIZE;
 		uint32_t sendsize = 0;
 
-		if (i < ASR_PAYLOAD_CHUNK_SIZE) {
-			size = i;
+		if (length - offset < ASR_PAYLOAD_CHUNK_SIZE) {
+			size = (uint32_t)(length - offset);
 		}
 
 		if (ipsw_file_read(file, data, size) != (int64_t)size) {
-			logger(LL_ERROR, "Error reading filesystem\n");
-			retry--;
+			/* the failed read might have moved the file position, so go
+			 * back to where this chunk starts before trying again */
+			if (++read_retries > ASR_PAYLOAD_MAX_READ_RETRIES
+			    || ipsw_file_seek(file, offset, SEEK_SET) < 0) {
+				logger(LL_ERROR, "Error reading filesystem at offset 0x%" PRIx64 "\n", offset);
+				break;
+			}
+			logger(LL_WARNING, "Error reading filesystem at offset 0x%" PRIx64 ", retrying (%d/%d)...\n", offset, read_retries, ASR_PAYLOAD_MAX_READ_RETRIES);
 			continue;
 		}
+		read_retries = 0;
 
 		sendsize = size;
 		if (asr->checksum_chunks) {
 			sha1((unsigned char*)data, size, (unsigned char*)(data+size));
 			sendsize += 20;
 		}
+		/* asr_send_buffer() already resumes stalled and partial sends; if
+		 * it still fails, the device stopped accepting data or the
+		 * connection is gone. */
 		if (asr_send_buffer(asr, data, sendsize) < 0) {
-			logger(LL_ERROR, "Unable to send filesystem payload chunk, retrying...\n");
-			retry--;
-			continue;
+			logger(LL_ERROR, "Unable to send filesystem payload chunk at offset 0x%" PRIx64 "\n", offset);
+			break;
 		}
 
-		bytes += size;
-		progress = ((double)bytes / (double)length);
+		offset += size;
+		progress = ((double)offset / (double)length);
 		if (asr->progress_cb && ((int)(progress*100) > asr->lastprogress)) {
 			asr->progress_cb(progress, asr->progress_cb_data);
 			asr->lastprogress = (int)(progress*100);
 		}
-
-		i -= size;
 	}
 
 	free(data);
-	return (i == 0) ? 0 : -1;
+	return (offset == length) ? 0 : -1;
 }
