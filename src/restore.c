@@ -302,6 +302,13 @@ irecv_device_t restore_get_irecv_device(struct idevicerestore_client_t* client)
 
 	plist_get_string_val(node, &model);
 	plist_free(node);
+	if (client->flags & FLAG_DEV_AS_AP) {
+		char* dev = strstr(model, "DEV");
+		if (dev && dev[3] == '\0') {
+			logger(LL_INFO, "INFO: Treating hardware model %s as AP\n", model);
+			memcpy(dev, "AP", 3);
+		}
+	}
 	irecv_devices_get_device_by_hardware_model(model, &irecv_device);
 	free(model);
 

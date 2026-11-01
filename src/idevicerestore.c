@@ -98,6 +98,7 @@ static struct option longopts[] = {
 	{ "exclusive-usb",  no_argument,       NULL,  4  },
 #endif
 	{ "sep-key",        required_argument, NULL,  5  },
+	{ "dev-as-ap",      no_argument,       NULL,  6  },
 	{ NULL, 0, NULL, 0 }
 };
 
@@ -171,6 +172,8 @@ static void usage(int argc, char* argv[], int err)
 	"  --sep-key IVKEY       Decrypt SEP firmware with IVKEY (hex IV followed by\n" \
 	"                        AES-256 key) and install it unencrypted; requires a\n" \
 	"                        signing server that signs arbitrary digests (-s)\n" \
+	"  --dev-as-ap           Treat a DEV hardware model reported in Restore mode\n" \
+	"                        as its AP counterpart (e.g. D47DEV -> D47AP)\n" \
 	"  --ignore-errors       Try to continue the restore process after certain\n" \
 	"                        errors (like a failed baseband update)\n" \
 	"                        WARNING: This might render the device unable to boot\n" \
@@ -1999,6 +2002,10 @@ int main(int argc, char* argv[])
 				return EXIT_FAILURE;
 			}
 		}	break;
+
+		case 6:
+			client->flags |= FLAG_DEV_AS_AP;
+			break;
 
 		default:
 			usage(argc, argv, 1);
